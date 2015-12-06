@@ -39,19 +39,36 @@ typedef struct aeApiState {
 static int aeApiCreate(aeEventLoop *eventLoop) {
     aeApiState *state = zmalloc(sizeof(aeApiState));
 
-    if (!state) return -1;
-    state->events = zmalloc(sizeof(struct epoll_event)*eventLoop->setsize);
+    //if (!state) return -1;
+    if (!state) goto err;
+    state->events = zmalloc(sizeof(struct epoll_event) * eventLoop->setsize);
     if (!state->events) {
-        zfree(state);
-        return -1;
+        //zfree(state);
+        //return -1;
+        goto err;
     }
-    state->epfd = epoll_create(1024); /* 1024 is just an hint for the kernel */
+    state->epfd = epoll_create(1024); /* 1024 is just a hint for the kernel */
     if (state->epfd == -1) {
-        zfree(state->events);
-        zfree(state);
-        return -1;
+        //zfree(state->events);
+        //zfree(state);
+        //return -1;
+        goto err;
     }
     eventLoop->apidata = state;
+    return 0;
+
+err:
+    if (state) {
+        zfree(state->events);
+        zfree(state);
+    }
+    return -1;
+}
+
+static int aeApiResize(aeEventLoop *eventLoop, int setsize) {
+    aeApiState *state = eventLoop->apidata;
+
+    state->events = zrealloc(state->events, sizeof(struct epoll_event) * setsize);
     return 0;
 }
 
@@ -63,8 +80,14 @@ static void aeApiFree(aeEventLoop *eventLoop) {
     zfree(state);
 }
 
+/*
+ * call epoll_ctl, with EPOLL_CTL_ADD or EPOLL_CTL_MOD.
+ *
+ * TODO Level Triggered currently, maybe Edge Triggered is prefer
+ */
 static int aeApiAddEvent(aeEventLoop *eventLoop, int fd, int mask) {
     aeApiState *state = eventLoop->apidata;
+    //ee is in stack, won't be release after function return? if so, then it will error when epoll_event of epoll_ctrl
     struct epoll_event ee;
     /* If the fd was already monitored for some event, we need a MOD
      * operation. Otherwise we need an ADD operation. */
@@ -73,14 +96,16 @@ static int aeApiAddEvent(aeEventLoop *eventLoop, int fd, int mask) {
 
     ee.events = 0;
     mask |= eventLoop->events[fd].mask; /* Merge old events */
-    if (mask & AE_READABLE) ee.events |= EPOLLIN;
+    if (mask & AE_READABLE) ee.events |= EPOLLIN; /* TODO: add EPOLLPRI */
     if (mask & AE_WRITABLE) ee.events |= EPOLLOUT;
     ee.data.u64 = 0; /* avoid valgrind warning */
     ee.data.fd = fd;
+    //Level Triggered
     if (epoll_ctl(state->epfd,op,fd,&ee) == -1) return -1;
     return 0;
 }
 
+//delete or modify delmask event of fd from eventLoop->epfd
 static void aeApiDelEvent(aeEventLoop *eventLoop, int fd, int delmask) {
     aeApiState *state = eventLoop->apidata;
     struct epoll_event ee;
@@ -91,6 +116,7 @@ static void aeApiDelEvent(aeEventLoop *eventLoop, int fd, int delmask) {
     if (mask & AE_WRITABLE) ee.events |= EPOLLOUT;
     ee.data.u64 = 0; /* avoid valgrind warning */
     ee.data.fd = fd;
+    //FIXME following epoll_ctl will always success ?
     if (mask != AE_NONE) {
         epoll_ctl(state->epfd,EPOLL_CTL_MOD,fd,&ee);
     } else {
@@ -100,10 +126,16 @@ static void aeApiDelEvent(aeEventLoop *eventLoop, int fd, int delmask) {
     }
 }
 
+/*
+ * wait for EPOLLIN, EPOLLOUT, EPOLLERR and EPOLLHUP event add add to eventLoop->fired
+ *
+ * before calling aeApiPoll next time, the eventLoop->fired must be handled
+ */
 static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
     aeApiState *state = eventLoop->apidata;
     int retval, numevents = 0;
 
+    //FIXME error handler
     retval = epoll_wait(state->epfd,state->events,eventLoop->setsize,
             tvp ? (tvp->tv_sec*1000 + tvp->tv_usec/1000) : -1);
     if (retval > 0) {
