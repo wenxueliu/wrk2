@@ -30,6 +30,27 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+ /*
+  * 程序执行范例:
+  *     loop = aeCreateEventLoop(10) 创建事件
+  *     aeCreateFileEvent(loop, fd, AE_READABLE | AE_WRITABLE, proc, NULL);
+  *     aeCreateTimeEvent(loop, 10, proc, NULL, NULL) 将事件加入 aeEventLoop,
+  *     对于 proc :
+  *         如果还要处理, 返回下次处理的间隔的时间;
+  *         不需要再调用, 返回 AE_NOMORE
+  *
+  *     aeMain(loop)
+  *     aeDeleteEventLoop(aeEventLoop)
+  *
+  * 程序执行流表:
+  * 1. 遍历 timeEvent 找到距离下次执行 Event 的时间.
+  * 2. 在等待下次 timeEvent 到期期间, 如果 fileEvent 相关 fd 的可读或可写事件, 就处理之.
+  * 3. 当处理完所有的 firedEvent 或 timeEvent 到达, 遍历所有 timeEvent.  执行在当前时间需要执行的 timeEvent
+  *
+  * 多线程下, 每个 thread 创建一个 aeEventLoop 对象. 避免锁的竞争.
+  * 具体参考 wrk.c 的使用范例.
+  */
+
 #ifndef __AE_H__
 #define __AE_H__
 
@@ -74,7 +95,7 @@ typedef struct aeTimeEvent {
     aeTimeProc *timeProc;
     aeEventFinalizerProc *finalizerProc;
     void *clientData;
-    struct aeTimeEvent *next;
+    struct aeTimeEvent *next; /* point to aeEventLoop->timeEventHead */
 } aeTimeEvent;
 
 /* A fired event */
@@ -85,14 +106,20 @@ typedef struct aeFiredEvent {
 
 /* State of an event based program */
 typedef struct aeEventLoop {
-    int maxfd;   /* highest file descriptor currently registered */
+    int maxfd;   /* highest file descriptor currently registered in aeFileEvent*/
     int setsize; /* max number of file descriptors tracked */
-    long long timeEventNextId;
+    long long timeEventNextId; /* the number of aeTimeEvent*/
     time_t lastTime;     /* Used to detect system clock skew */
+
+    //以 fd 为索引的数组, fd 这里既扮演文件描述符也扮演索引 id
     aeFileEvent *events; /* Registered events */
+
     aeFiredEvent *fired; /* Fired events */
-    aeTimeEvent *timeEventHead;
+
+    aeTimeEvent *timeEventHead; /*point to the head of aeTimeEvent list, last add aeTimeEvent*/
     int stop;
+
+    //evport epoll poll select, c 中的泛型使用方法, 对应设计模式的工厂模式
     void *apidata; /* This is used for polling API specific data */
     aeBeforeSleepProc *beforesleep;
 } aeEventLoop;
@@ -114,5 +141,7 @@ int aeWait(int fd, int mask, long long milliseconds);
 void aeMain(aeEventLoop *eventLoop);
 char *aeGetApiName(void);
 void aeSetBeforeSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *beforesleep);
+int aeGetSetSize(aeEventLoop *eventLoop);
+int aeResizeSetSize(aeEventLoop *eventLoop, int setsize);
 
 #endif

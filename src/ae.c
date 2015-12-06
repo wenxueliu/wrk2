@@ -60,6 +60,19 @@
     #endif
 #endif
 
+
+/*
+ * Example:
+ *     aeEventLoop *loop = aeCreateEventLoop(10 + cfg.connections * 3);
+ *     if (NULL == loop) {
+ *         char *msg = strerror(errno);
+ *         fprintf(stderr, "unable to create thread %"PRIu64": %s\n", i, msg);
+ *         exit(2);
+ *     }
+ *
+ * Note:
+ *     learn the error handler, goto here is prefect.
+ */
 aeEventLoop *aeCreateEventLoop(int setsize) {
     aeEventLoop *eventLoop;
     int i;
@@ -75,6 +88,7 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     eventLoop->stop = 0;
     eventLoop->maxfd = -1;
     eventLoop->beforesleep = NULL;
+    //初始化 eventLoop->apidata
     if (aeApiCreate(eventLoop) == -1) goto err;
     /* Events with mask == AE_NONE are not set. So let's initialize the
      * vector with it. */
@@ -91,6 +105,36 @@ err:
     return NULL;
 }
 
+/* Return the current set size. */
+int aeGetSetSize(aeEventLoop *eventLoop) {
+    return eventLoop->setsize;
+}
+
+/* Resize the maximum set size of the event loop.
+ * If the requested set size is smaller than the current set size, but
+ * there is already a file descriptor in use that is >= the requested
+ * set size minus one, AE_ERR is returned and the operation is not
+ * performed at all.
+ *
+ * Otherwise AE_OK is returned and the operation is successful. */
+int aeResizeSetSize(aeEventLoop *eventLoop, int setsize) {
+    int i;
+
+    if (setsize == eventLoop->setsize) return AE_OK;
+    if (eventLoop->maxfd >= setsize) return AE_ERR;
+    if (aeApiResize(eventLoop,setsize) == -1) return AE_ERR;
+
+    eventLoop->events = zrealloc(eventLoop->events,sizeof(aeFileEvent)*setsize);
+    eventLoop->fired = zrealloc(eventLoop->fired,sizeof(aeFiredEvent)*setsize);
+    eventLoop->setsize = setsize;
+
+    /* Make sure that if we created new slots, they are initialized with
+     * an AE_NONE mask. */
+    for (i = eventLoop->maxfd+1; i < setsize; i++)
+        eventLoop->events[i].mask = AE_NONE;
+    return AE_OK;
+}
+
 void aeDeleteEventLoop(aeEventLoop *eventLoop) {
     aeApiFree(eventLoop);
     zfree(eventLoop->events);
@@ -102,6 +146,15 @@ void aeStop(aeEventLoop *eventLoop) {
     eventLoop->stop = 1;
 }
 
+/*
+ * Example:
+ *
+ * fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+ * flags = AE_READABLE | AE_WRITABLE;
+ * if (aeCreateFileEvent(loop, fd, flags, socket_connected, c) == AE_ERR) {
+ *     close(fd)
+ * }
+ */
 int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         aeFileProc *proc, void *clientData)
 {
@@ -111,6 +164,7 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
     }
     aeFileEvent *fe = &eventLoop->events[fd];
 
+    //epoll_ctl
     if (aeApiAddEvent(eventLoop, fd, mask) == -1)
         return AE_ERR;
     fe->mask |= mask;
@@ -122,12 +176,19 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
     return AE_OK;
 }
 
+/* the delete semantic return void
+ *
+ * aeDeleteFileEvent(loop, fd, AE_READABLE)
+ * aeDeleteFileEvent(loop, fd, AE_WRITABLE)
+ * aeDeleteFileEvent(loop, fd, AE_WRITABLE | AE_READABLE)
+ */
 void aeDeleteFileEvent(aeEventLoop *eventLoop, int fd, int mask)
 {
     if (fd >= eventLoop->setsize) return;
     aeFileEvent *fe = &eventLoop->events[fd];
-
     if (fe->mask == AE_NONE) return;
+
+    aeApiDelEvent(eventLoop, fd, mask);
     fe->mask = fe->mask & (~mask);
     if (fd == eventLoop->maxfd && fe->mask == AE_NONE) {
         /* Update the max fd */
@@ -137,11 +198,23 @@ void aeDeleteFileEvent(aeEventLoop *eventLoop, int fd, int mask)
             if (eventLoop->events[j].mask != AE_NONE) break;
         eventLoop->maxfd = j;
     }
-    aeApiDelEvent(eventLoop, fd, mask);
 }
 
+/*
+ * Example:
+ *
+ * int event=aeGetFileEvents(loop, fd)
+ * if (event & AE_READABLE) {
+ *   //read
+ * } else if (event & AE_WRITABLE) {
+ *   //write
+ * } else { // AE_NONE
+ *   //...
+ * }
+ *
+ */
 int aeGetFileEvents(aeEventLoop *eventLoop, int fd) {
-    if (fd >= eventLoop->setsize) return 0;
+    if (fd >= eventLoop->setsize) return AE_NONE;
     aeFileEvent *fe = &eventLoop->events[fd];
 
     return fe->mask;
@@ -156,6 +229,12 @@ static void aeGetTime(long *seconds, long *milliseconds)
     *milliseconds = tv.tv_usec/1000;
 }
 
+/*
+ * cur_time + milliseconds store to sec and ms
+ * @milliseconds : added milliseconds
+ * @sec          : now + milliseconds of expected sec
+ * @ms           : now + milliseconds of expected ms
+ */
 static void aeAddMillisecondsToNow(long long milliseconds, long *sec, long *ms) {
     long cur_sec, cur_ms, when_sec, when_ms;
 
@@ -170,6 +249,17 @@ static void aeAddMillisecondsToNow(long long milliseconds, long *sec, long *ms) 
     *ms = when_ms;
 }
 
+/*
+ * add aeTimeEvent to list, the new added aeTimeEvent is at the head of list. access by aeEventLoop->timeEventHead
+ *
+ * list: insert is O(1) but delete is O(n), search O(n)
+ * array: insert is O(n) but delete is O(1), search O(n)
+ * skiplist : insert is O(log(N)) search O(1)
+ *
+ * FIXME: may array is better ? for example, aeDeleteTimeEvent will O(1). now O(n)
+ * TODO: 1. limit the aeTimeEvent size
+ *       2. make insert and delete with O(1)
+ */
 long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds,
         aeTimeProc *proc, void *clientData,
         aeEventFinalizerProc *finalizerProc)
@@ -189,6 +279,7 @@ long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds,
     return id;
 }
 
+/* delete aeTimeEvent for aeEventLoop by id */
 int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id)
 {
     aeTimeEvent *te, *prev = NULL;
@@ -237,6 +328,16 @@ static aeTimeEvent *aeSearchNearestTimer(aeEventLoop *eventLoop)
     return nearest;
 }
 
+/*
+ * 一个依赖时序的系统，必须考虑时间问题。比如认为修改时间，闰秒。应此 NTP 是非常需要和推荐的
+ * now < eventLoop->lastTime，认为是系统时间被修改了, 因此, 强制将所有时间事件设置为 0
+ *
+ * 找到 id < (eventLoop->timeEventNextId-1)  的所有时间事件, 对满足每个事件, 调用timeProc():
+ * 如果还需要处理, 修改 timeEvent 的时间为当前时间到下次处理时间的时间间隔;
+ * 否则删除该时间事件
+ *
+ * 返回处理过的时间事件个数.
+*/
 /* Process time events */
 static int processTimeEvents(aeEventLoop *eventLoop) {
     int processed = 0;
@@ -259,10 +360,16 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
             te = te->next;
         }
     }
+
     eventLoop->lastTime = now;
 
     te = eventLoop->timeEventHead;
     maxId = eventLoop->timeEventNextId-1;
+
+    /* 找到小于 maxId 的所有事件，如果事件发生于当前时间之前，调用时间处理函数timeProc（）
+     * 注意该函数的返回值，如果不是 -1，返回值表示该事件等待的时间
+     * 问题：由于遍历时间列表，可能下次处理该事件的时间不好很及时，这 timeProc（）的处理时间相关。
+     */
     while(te) {
         long now_sec, now_ms;
         long long id;
@@ -309,7 +416,7 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
 /* Process every pending time event, then every pending file event
  * (that may be registered by time event callbacks just processed).
  * Without special flags the function sleeps until some file event
- * fires, or when the next time event occurrs (if any).
+ * fires, or when the next time event occurs (if any).
  *
  * If flags is 0, the function does nothing and returns.
  * if flags has AE_ALL_EVENTS set, all the kind of events are processed.
@@ -319,6 +426,18 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
  * the events that's possible to process without to wait are processed.
  *
  * The function returns the number of events processed. */
+
+ /*
+  * 1. 找到距离当前时间最近需要处理事件的时间间隔
+  * 2. 等待时间事件到达, 期间将待处理的文件事件加入 aeEventLoop->fired
+  * 3. 处理 aeEventLoop->fired 中的事件
+  * 4. 遍历并处理 aeEventLoop->timeEventHead 列表中的所有事件.
+  * 返回被处理的 fileEvent 和 timeEvent 的总数
+  *
+  * 1. fileEvent : 调用 aeApiPoll(eventLoop, tvp) 将事件加入 firedEvent 中, 返回需要处理的事件个数.
+  *    从 eventLoop 通过 firedEvent 找到对应的文件事件, 调用对应的 rfileProc() 或 rfileProc()
+  * 2. timeEvent : 调用 processTimeEvents()
+ */
 int aeProcessEvents(aeEventLoop *eventLoop, int flags)
 {
     int processed = 0, numevents;
@@ -333,12 +452,19 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
     if (eventLoop->maxfd != -1 ||
         ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))) {
         int j;
+        //最近的 aeTimeEvent
         aeTimeEvent *shortest = NULL;
+        //tvp : 记录下一个事件开始时间与当前时间的差值, 如果事件发生于当前时间之前, 为 0, 在当前时间之后大于 0
         struct timeval tv, *tvp;
 
-        if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT))
+        if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT)) {
+            //O(N)
             shortest = aeSearchNearestTimer(eventLoop);
-        if (shortest) {
+        }
+
+
+        // 事件队列不为 null 并且 flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT)
+        if (shortest != NULL) {
             long now_sec, now_ms;
 
             /* Calculate the time missing for the nearest
@@ -356,17 +482,23 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             if (tvp->tv_usec < 0) tvp->tv_usec = 0;
         } else {
             /* If we have to check for events but need to return
-             * ASAP because of AE_DONT_WAIT we need to se the timeout
+             * ASAP because of AE_DONT_WAIT we need to set the timeout
              * to zero */
+
             if (flags & AE_DONT_WAIT) {
                 tv.tv_sec = tv.tv_usec = 0;
                 tvp = &tv;
-            } else {
+            } else {  // !(flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT)
                 /* Otherwise we can block */
                 tvp = NULL; /* wait forever */
             }
         }
 
+        /*
+         * tvp： 当前时间与时间事件的差值, rfileProc()， wfileProc() 如果是耗时操作, 就不太好了。
+         * 1. 将待处理的 aeFileEvent 加入 aeEventLoop->fired
+         * 2. 遍历 aeEventLoop->fired, 处理 aeEventLoop->fired 中的事件
+         */
         numevents = aeApiPoll(eventLoop, tvp);
         for (j = 0; j < numevents; j++) {
             aeFileEvent *fe = &eventLoop->events[eventLoop->fired[j].fd];
@@ -374,9 +506,10 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             int fd = eventLoop->fired[j].fd;
             int rfired = 0;
 
-	    /* note the fe->mask & mask & ... code: maybe an already processed
+	        /* note the fe->mask & mask & ... code: maybe an already processed
              * event removed an element that fired and we still didn't
-             * processed, so we check if the event is still valid. */
+             * processed, so we check if the event is still valid. 
+             */
             if (fe->mask & mask & AE_READABLE) {
                 rfired = 1;
                 fe->rfileProc(eventLoop,fd,fe->clientData,mask);
@@ -389,13 +522,15 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
         }
     }
     /* Check time events */
-    if (flags & AE_TIME_EVENTS)
+    if (flags & AE_TIME_EVENTS) {
+        //处理 timeEvent, 返回处理过的 timeEvent
         processed += processTimeEvents(eventLoop);
+    }
 
     return processed; /* return the number of processed file/time events */
 }
 
-/* Wait for millseconds until the given file descriptor becomes
+/* Wait for milliseconds until the given file descriptor becomes
  * writable/readable/exception */
 int aeWait(int fd, int mask, long long milliseconds) {
     struct pollfd pfd;
@@ -409,7 +544,7 @@ int aeWait(int fd, int mask, long long milliseconds) {
     if ((retval = poll(&pfd, 1, milliseconds))== 1) {
         if (pfd.revents & POLLIN) retmask |= AE_READABLE;
         if (pfd.revents & POLLOUT) retmask |= AE_WRITABLE;
-	if (pfd.revents & POLLERR) retmask |= AE_WRITABLE;
+	    if (pfd.revents & POLLERR) retmask |= AE_WRITABLE;
         if (pfd.revents & POLLHUP) retmask |= AE_WRITABLE;
         return retmask;
     } else {
@@ -417,6 +552,7 @@ int aeWait(int fd, int mask, long long milliseconds) {
     }
 }
 
+//Main 函数
 void aeMain(aeEventLoop *eventLoop) {
     eventLoop->stop = 0;
     while (!eventLoop->stop) {
