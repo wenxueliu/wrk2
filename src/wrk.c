@@ -59,7 +59,7 @@ static void usage() {
            "    -H, --header      <H>  Add header to request      \n"
            "    -L  --latency          Print latency statistics   \n"
            "    -U  --u_latency        Print uncorrceted latency statistics\n"
-           "        --timeout     <T>  Socket/request timeout     \n"
+           "    -T  --timeout     <T>  Socket/request timeout default 2s   \n"
            "    -B, --batch_latency    Measure latency of whole   \n"
            "                           batches of pipelined ops   \n"
            "                           (as opposed to each op)    \n"
@@ -121,11 +121,15 @@ int main(int argc, char **argv) {
     uint64_t throughput = cfg.rate / cfg.threads;
     uint64_t stop_at     = time_us() + (cfg.duration * 1000000);
 
+    /*
+     * 每个线程独享一个 aeEventLoop 因此, 不必对 aeEventLoop 加锁
+     */
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t = &threads[i];
+        //why 10+cfg.connections * 3
         t->loop        = aeCreateEventLoop(10 + cfg.connections * 3);
         t->connections = connections;
-        t->throughput = throughput;;
+        t->throughput  = throughput;;
         t->stop_at     = stop_at;
 
         t->L = script_create(cfg.script, url, headers);
@@ -260,6 +264,7 @@ void *thread_main(void *arg) {
         script_request(thread->L, &request, &length);
     }
 
+    //TPS of req/us
     double throughput = (thread->throughput / 1000000.0) / thread->connections;
 
     connection *c = thread->cs;
@@ -273,14 +278,26 @@ void *thread_main(void *arg) {
         c->catch_up_throughput = throughput * 2;
         c->complete   = 0;
         c->caught_up  = true;
-        // Stagger connects 5 msec apart within thread:
+        /*
+         * connect add add fd to aeEventLoop->events
+         *
+         * Stagger connects 5 msec apart within thread:
+         *
+         * FIXME :(thread->connections - i) * 5  is better than i * 5 ? because
+         * the new added aeTimeEvent at the head of list
+         *
+         * NOTE:
+         *  c is param of delayed_initial_connect
+         */
         aeCreateTimeEvent(loop, i * 5, delayed_initial_connect, c, NULL);
     }
 
     uint64_t calibrate_delay = CALIBRATE_DELAY_MS + (thread->connections * 5);
     uint64_t timeout_delay = TIMEOUT_INTERVAL_MS + (thread->connections * 5);
 
+    //every calibrate_delay seconds calibrate
     aeCreateTimeEvent(loop, calibrate_delay, calibrate, thread, NULL);
+    //every timeout_delay seconds check the timeout times
     aeCreateTimeEvent(loop, timeout_delay, check_timeouts, thread, NULL);
 
     thread->start = time_us();
@@ -292,6 +309,9 @@ void *thread_main(void *arg) {
     return NULL;
 }
 
+/*
+ * connect and add fd to aeEventLoop->events[fd]
+ */
 static int connect_socket(thread *thread, connection *c) {
     struct addrinfo *addr = thread->addr;
     struct aeEventLoop *loop = thread->loop;
@@ -360,11 +380,13 @@ static int calibrate(aeEventLoop *loop, long long id, void *data) {
             (thread->mean)/1000.0,
             thread->interval);
 
+    //every thread->interval sample the statistics
     aeCreateTimeEvent(loop, thread->interval, sample_rate, thread, NULL);
 
     return AE_NOMORE;
 }
 
+//every TIMEOUT_INTERVAL_MS check the timeout times
 static int check_timeouts(aeEventLoop *loop, long long id, void *data) {
     thread *thread = data;
     connection *c  = thread->cs;
