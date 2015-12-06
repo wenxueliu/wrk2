@@ -725,4 +725,17 @@ Example 2: [1.4 second ^Z artifact introduced on the httpd server]:
     Requests/sec:   2001.42
     Transfer/sec:    676.57KB
 
+###Desigen Guide
+
+-c connections
+-t threads
+-R ratelimit
+
+every thread will consumer 'connections/threads' connections.
+
+every connection must try keep 'ratelimit/(threads*(connections/threads)' connections, so that every 
+http request shoud be completed in '(ratelimit/1000000)/(connections/threads)' ms
+
+next request should start at conntions start time + completed_connections/per_request_ms
+
 [CO example]:https://raw.github.com/giltene/wrk2/master/CoordinatedOmission/wrk2_CleanVsCO.png "Coordinated Omission example"
